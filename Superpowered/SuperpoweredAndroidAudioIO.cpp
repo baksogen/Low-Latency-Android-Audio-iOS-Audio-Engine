@@ -27,7 +27,7 @@ typedef struct SuperpoweredAndroidAudioIOInternals {
     SLAndroidSimpleBufferQueueItf outputBufferQueueInterface, inputBufferQueueInterface;
     // No sync needed
     int fifoFirstSample, fifoLastSample, silenceSamples;
-    std::mutex mutex;
+    std::mutex processMutex;
     // Atomicity is enough for these. (Btw, GCC version tested lacks std::atomic_init() for bools)
     std::atomic<bool> foreground = ATOMIC_VAR_INIT(false), started = ATOMIC_VAR_INIT(false);
     // Thread-safe (set at startup and only read on processing thread(s))
