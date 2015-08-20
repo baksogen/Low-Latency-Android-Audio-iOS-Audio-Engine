@@ -20,7 +20,6 @@ typedef struct SuperpoweredAndroidAudioIOInternals {
     // this is a good place to do the checks, close to the fields using this type
     SuperpoweredAndroidAudioIOInternals() {
         assert(std::atomic<bool>().is_lock_free());
-        assert(std::atomic<unsigned>().is_lock_free());
     }
 #endif
     // The OpenSL ES callback may run on a different thread each time but is not reentrant (by docs),
@@ -32,7 +31,7 @@ typedef struct SuperpoweredAndroidAudioIOInternals {
     SLObjectItf openSLEngine, outputMix, outputBufferQueue, inputBufferQueue;
     SLAndroidSimpleBufferQueueItf outputBufferQueueInterface, inputBufferQueueInterface;
     // (1)
-    std::atomic<unsigned> headBufIdx, tailBufIdx;
+    unsigned headBufIdx, tailBufIdx;
     static_assert((UINT_MAX % NUM_BUFFERS + 1) % NUM_BUFFERS == ((UINT_MAX + 1) % NUM_BUFFERS), "");
     Buffer buffers[NUM_BUFFERS];
     // No sync needed
@@ -96,6 +95,7 @@ static void startQueues(SuperpoweredAndroidAudioIOInternals *internals) {
     internals->started = true;
     internals->headBufIdx = 0;
     internals->tailBufIdx = 1;
+    std::atomic_thread_fence(std::memory_order_release); // Sync headBufIdx to OpenSL thread
     if (internals->inputBufferQueue) {
         internals->inputThread = std::thread([=] () {
             processingLoop(processInput, internals);
@@ -112,7 +112,7 @@ static void startQueues(SuperpoweredAndroidAudioIOInternals *internals) {
         (*internals->outputBufferQueue)->GetInterface(internals->outputBufferQueue, SL_IID_PLAY, &outputPlayInterface);
         (*outputPlayInterface)->SetPlayState(outputPlayInterface, SL_PLAYSTATE_PLAYING);
     };
-    std::atomic_thread_fence(std::memory_order_release);
+    std::atomic_thread_fence(std::memory_order_release); // Sync everything else
 }
 
 static void processInput(SuperpoweredAndroidAudioIOInternals *internals) {
@@ -121,9 +121,9 @@ static void processInput(SuperpoweredAndroidAudioIOInternals *internals) {
 
 static void processOutput(SuperpoweredAndroidAudioIOInternals *internals) {
     if (!internals->hasInput) {
-        __android_log_print(ANDROID_LOG_DEBUG, "FL", "processOutput");
         // Process to tail
-        const auto outBufIdx = internals->tailBufIdx.fetch_add(1) % NUM_BUFFERS;
+        const auto outBufIdx = internals->tailBufIdx;
+        internals->tailBufIdx = (outBufIdx + 1) % NUM_BUFFERS;
         auto& outBuf = internals->buffers[outBufIdx];
         if (!internals->callback(internals->clientdata, outBuf.data(), internals->buffersize, internals->samplerate)) {
             std::fill(outBuf.begin(), outBuf.end(), 0);
@@ -147,17 +147,19 @@ static void SuperpoweredAndroidAudioIO_InputCallback(SLAndroidSimpleBufferQueueI
 }
 
 static void SuperpoweredAndroidAudioIO_OutputCallback(SLAndroidSimpleBufferQueueItf caller, void *pContext) {
-    __android_log_print(ANDROID_LOG_DEBUG, "FL", "OutputCallback");
     SuperpoweredAndroidAudioIOInternals *internals = (SuperpoweredAndroidAudioIOInternals *)pContext;
-    std::atomic_thread_fence(std::memory_order_acquire); // Sync from startup and processing thread
+    std::atomic_thread_fence(std::memory_order_acquire); // Sync from startup,processing thread and OpenSL ES threads
 
     // Enqueue head
-    const auto outBufIdx = internals->headBufIdx.fetch_add(1) % NUM_BUFFERS;
+    const auto outBufIdx = internals->headBufIdx;
+    internals->headBufIdx = (outBufIdx + 1) % NUM_BUFFERS;
     auto& outBuf = internals->buffers[outBufIdx];
     (*internals->outputBufferQueueInterface)->Enqueue(internals->outputBufferQueueInterface, outBuf.data(), internals->buffersize * 4);
 
     // Signal to process another one
     pthread_kill(internals->outputThread.native_handle(), SIGUSR1);
+
+    std::atomic_thread_fence(std::memory_order_release); // Sync to OpenSL ES threads
 }
 
 SuperpoweredAndroidAudioIO::SuperpoweredAndroidAudioIO(int samplerate, int buffersize, bool enableInput, bool enableOutput, audioProcessingCallback callback, void *clientdata, int latencySamples) {
@@ -215,14 +217,13 @@ SuperpoweredAndroidAudioIO::SuperpoweredAndroidAudioIO(int samplerate, int buffe
     if (enableInput) { // Initialize the input buffer queue.
         (*internals->inputBufferQueue)->GetInterface(internals->inputBufferQueue, SL_IID_ANDROIDSIMPLEBUFFERQUEUE, &internals->inputBufferQueueInterface);
         (*internals->inputBufferQueueInterface)->RegisterCallback(internals->inputBufferQueueInterface, SuperpoweredAndroidAudioIO_InputCallback, internals);
-        //assert(false); // Not implemented
-        //(*internals->inputBufferQueueInterface)->Enqueue(internals->inputBufferQueueInterface, internals->fifobuffer, buffersize * 4);
+        // TODO: Enqueue first buffer (needed for init?)
     };
 
     if (enableOutput) { // Initialize the output buffer queue.
         (*internals->outputBufferQueue)->GetInterface(internals->outputBufferQueue, SL_IID_BUFFERQUEUE, &internals->outputBufferQueueInterface);
         (*internals->outputBufferQueueInterface)->RegisterCallback(internals->outputBufferQueueInterface, SuperpoweredAndroidAudioIO_OutputCallback, internals);
-        //(*internals->outputBufferQueueInterface)->Enqueue(internals->outputBufferQueueInterface, internals->silence, buffersize * 4);
+        (*internals->outputBufferQueueInterface)->Enqueue(internals->outputBufferQueueInterface, internals->silence, buffersize * 4);
     };
 
     startQueues(internals);
