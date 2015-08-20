@@ -9,6 +9,7 @@
 #include <vector>
 #include <signal.h>
 #include <unistd.h>
+#include <sys/resource.h>
 
 static const int NUM_BUFFERS = 2;
 
@@ -55,6 +56,13 @@ static void processingLoop(std::function<void(SuperpoweredAndroidAudioIOInternal
     sigaddset(&signalMask, SIGUSR1);
     sigaddset(&signalMask, SIGTERM);
     pthread_sigmask(SIG_BLOCK, &signalMask, nullptr);
+
+    // Rise priority as high as possible
+    for (auto nice = -19; nice < 0; ++nice) {
+        if (setpriority(PRIO_PROCESS, getpid(), nice) == 0) {
+            break;
+        }
+    }
 
     while (true) {
         int sig;
