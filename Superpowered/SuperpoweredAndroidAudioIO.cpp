@@ -11,7 +11,7 @@
 #include <unistd.h>
 #include <sys/resource.h>
 
-static const int NUM_BUFFERS = 2;
+static const int NUM_BUFFERS = 8; // 2 is the theoretically needed, but protect ourselves against overruns
 
 using Buffer = std::vector<short>;
 
